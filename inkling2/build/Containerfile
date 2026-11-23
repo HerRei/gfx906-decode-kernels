@@ -1,0 +1,4 @@
+# Build and runtime image: Fedora 44 with its ROCm 7.1 (gfx906 and gfx1200 kernels in rocBLAS) and Mesa.
+FROM registry.fedoraproject.org/fedora-toolbox:44
+RUN dnf -y install rocm-hip rocm-runtime rocblas hipblas rocminfo rocm-smi rocm-hip-devel hipblas-devel rocblas-devel \
+      hipcc rocm-cmake cmake gcc-c++ make git && dnf clean all

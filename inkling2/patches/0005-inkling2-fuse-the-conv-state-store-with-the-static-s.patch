@@ -1,0 +1,173 @@
+From 3d03322aaaa0c4d651bb1df17ef3504e95715100 Mon Sep 17 00:00:00 2001
+From: Hermes Reisner <hermes.reisner@stud.unibas.ch>
+Date: Sun, 22 Nov 2026 19:21:12 +0100
+Subject: [PATCH 5/6] inkling2 : fuse the conv state store with the static
+ short convolution
+
+CONCAT VIEW VIEW CPY SSM_CONV RESHAPE ADD SCALE in one kernel for one sequence; the concat is never
+written. Correct (test INK_conv) but no measurable gain on the VII, where two small dependent kernels
+in a HIP graph cost about as much as one. GGML_INK_NO_CATCONV=1 turns it off. Also adds flash
+attention and conv perf cases.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 44 ++++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/inkling.cu   | 43 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/inkling.cuh  |  4 +++
+ tests/test-backend-ops.cpp      | 10 ++++++++
+ 4 files changed, 100 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 76de7414c..fd9564431 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4596,7 +4596,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ // inputs stay alive until its output) and by the compute loop.
+ enum ggml_cuda_ink_kind { GGML_CUDA_INK_NONE, GGML_CUDA_INK_CLIP, GGML_CUDA_INK_SITU, GGML_CUDA_INK_CTRL,
+                           GGML_CUDA_INK_MIX, GGML_CUDA_INK_CONV, GGML_CUDA_INK_DCONV,
+-                          GGML_CUDA_INK_CATSTORE, GGML_CUDA_INK_CATRMS };
++                          GGML_CUDA_INK_CATSTORE, GGML_CUDA_INK_CATRMS, GGML_CUDA_INK_CATCONV };
+ 
+ struct ggml_cuda_ink_match {
+     ggml_cuda_ink_kind kind  = GGML_CUDA_INK_NONE;
+@@ -4808,6 +4808,40 @@ static bool ggml_cuda_ink_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_
+         }
+     }
+ 
++    // the state store directly followed by its static convolution + residual (one sequence):
++    // CONCAT(past, xt, 0) VIEW(last P) VIEW(state) CPY SSM_CONV(concat, w) RESHAPE ADD(cur, .) SCALE
++    if (node->op == GGML_OP_CONCAT && i + 8 <= cgraph->n_nodes && getenv("GGML_INK_NO_CATCONV") == nullptr &&
++            n[i+1]->op == GGML_OP_VIEW && n[i+2]->op == GGML_OP_VIEW && n[i+3]->op == GGML_OP_CPY &&
++            n[i+4]->op == GGML_OP_SSM_CONV && n[i+5]->op == GGML_OP_RESHAPE && n[i+6]->op == GGML_OP_ADD && n[i+7]->op == GGML_OP_SCALE) {
++        const ggml_tensor * cat = n[i], * v1 = n[i+1], * v2 = n[i+2], * cpy = n[i+3];
++        const ggml_tensor * conv = n[i+4], * rs = n[i+5], * add = n[i+6], * sc = n[i+7];
++        const ggml_tensor * past = cat->src[0], * xt = cat->src[1];
++        const ggml_tensor * w = conv->src[1], * cur = add->src[0];
++        const int P = past->ne[0];
++        const int T = xt->ne[0];
++        bool ok = ggml_get_op_params_i32(cat, 0) == 0 && v1->src[0] == cat && cpy->src[0] == v1 && cpy->src[1] == v2 &&
++                  past->type == GGML_TYPE_F32 && xt->type == GGML_TYPE_F32 && ggml_cuda_ink_f32c(cat) && v2->type == GGML_TYPE_F32 &&
++                  ggml_is_contiguous(v2) && cat->ne[2] == 1 && cat->ne[3] == 1 && past->ne[2] == 1 && xt->ne[2] == 1 &&
++                  past->ne[1] == cat->ne[1] && xt->ne[1] == cat->ne[1] &&
++                  v1->ne[0] == P && v1->ne[1] == cat->ne[1] && v1->ne[2] == 1 && v1->view_offs == (size_t) T*sizeof(float) &&
++                  v1->nb[1] == cat->nb[1] && ggml_nelements(v2) == (int64_t) P*cat->ne[1] &&
++                  conv->src[0] == cat && ggml_cuda_ink_f32c(w) && w->ne[0] == P + 1 && w->ne[1] == cat->ne[1] &&
++                  rs->src[0] == conv && add->src[1] == rs && sc->src[0] == add && ggml_get_op_params_f32(sc, 1) == 0.0f &&
++                  cur->type == GGML_TYPE_F32 && cur->nb[0] == sizeof(float) && ggml_are_same_shape(cur, add) &&
++                  rs->ne[0] == w->ne[1] && rs->ne[1] == T && rs->ne[2] == 1 && rs->ne[3] == 1 && ggml_are_same_shape(cur, rs) &&
++                  ggml_cuda_ink_f32c(sc) && ggml_nelements(sc) == (int64_t) w->ne[1]*T && cur->ne[2] == 1 && cur->ne[3] == 1;
++        if (ok) {
++            const int idxs[] = { i, i+1, i+3, i+4, i+5, i+6, i+7 };
++            const int outs[] = { i+3, i+7 };
++            ok = ggml_cuda_ink_subgraph_idx(cgraph, idxs, 7, outs, 2);
++        }
++        if (ok) {
++            m.kind = GGML_CUDA_INK_CATCONV; m.count = 8; m.a = past; m.b = xt; m.c = cur; m.d = w;
++            m.out2 = const_cast<ggml_tensor *>(v2); m.p[0] = ggml_get_op_params_f32(sc, 0);
++            return true;
++        }
++    }
++
+     // concat of the conv history and the new inputs, followed by the recurrent state store:
+     // CONCAT(past, xt, 0) VIEW(last P) VIEW(state) CPY
+     if (node->op == GGML_OP_CONCAT && i + 4 <= cgraph->n_nodes && n[i+1]->op == GGML_OP_VIEW && n[i+2]->op == GGML_OP_VIEW &&
+@@ -4969,6 +5003,14 @@ static int ggml_cuda_ink_try_fuse(ggml_backend_cuda_context * ctx, ggml_cgraph *
+             }
+             ggml_cuda_ink_conv_res(*ctx, m.a, m.b, m.c, m.p[0], dst);
+             break;
++        case GGML_CUDA_INK_CATCONV:
++            if (ggml_cuda_ink_overlap(dst, m.a) || ggml_cuda_ink_overlap(dst, m.b) || ggml_cuda_ink_overlap(dst, m.c) ||
++                ggml_cuda_ink_overlap(m.out2, m.a) || ggml_cuda_ink_overlap(m.out2, m.b) || ggml_cuda_ink_overlap(m.out2, m.c) ||
++                ggml_cuda_ink_overlap(m.out2, dst)) {
++                return 0;
++            }
++            ggml_cuda_ink_cat_conv_res(*ctx, m.a, m.b, m.d, m.c, m.p[0], dst, m.out2);
++            break;
+         case GGML_CUDA_INK_CATSTORE:
+             // dst is the state copy; the concat output is the first node
+             if (ggml_cuda_ink_overlap(cgraph->nodes[i], m.a) || ggml_cuda_ink_overlap(cgraph->nodes[i], m.b) ||
+diff --git a/ggml/src/ggml-cuda/inkling.cu b/ggml/src/ggml-cuda/inkling.cu
+index 2bf880ba0..94fbeebd4 100644
+--- a/ggml/src/ggml-cuda/inkling.cu
++++ b/ggml/src/ggml-cuda/inkling.cu
+@@ -631,3 +631,46 @@ void ggml_cuda_ink_cat_rms(ggml_backend_cuda_context & ctx, const ggml_tensor *
+                 Ea, Eb, 1, eps);
+     }
+ }
++
++// cat_store + conv_res in one kernel
++// x = concat(past [P, C], xt [T, C], 0); state[P*c + j] = x[T + j, c]; dst[t*C + c] = scale*(cur[t, c] + sum_k w[k, c]*x[t + k, c])
++// (one sequence). Replaces CONCAT VIEW VIEW CPY SSM_CONV RESHAPE ADD SCALE; the concat itself is never written.
++static __global__ void k_ink_cat_conv_res(const char * __restrict__ past, const char * __restrict__ xt, const float * __restrict__ w,
++        const float * __restrict__ cur, float * __restrict__ dst, float * __restrict__ state, const int P, const int T, const int C,
++        const size_t p_nb0, const size_t p_nb1, const size_t x_nb0, const size_t x_nb1, const int64_t cur_nb1, const float scale) {
++    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= (int64_t) C*T) {
++        return;
++    }
++    const int c = i % C;
++    const int t = i / C;
++    auto xv = [&](int j) -> float {
++        return j < P ? *(const float *) (past + j*p_nb0 + c*p_nb1) : *(const float *) (xt + (j - P)*x_nb0 + c*x_nb1);
++    };
++    const float * wc = w + (size_t) c*(P + 1);
++    float acc = 0.0f;
++    for (int k = 0; k <= P; ++k) {
++        acc += xv(t + k)*wc[k];
++    }
++    dst[(size_t) t*C + c] = scale*(cur[(size_t) t*cur_nb1 + c] + acc);
++    if (t == 0) {
++        for (int j = 0; j < P; ++j) {
++            state[(size_t) P*c + j] = xv(T + j);
++        }
++    }
++}
++
++void ggml_cuda_ink_cat_conv_res(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * xt, const ggml_tensor * w,
++        const ggml_tensor * cur, float scale, ggml_tensor * dst, ggml_tensor * state) {
++    GGML_ASSERT(past->type == GGML_TYPE_F32 && xt->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && cur->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ggml_is_contiguous(state));
++    GGML_ASSERT(ggml_is_contiguous(w) && cur->nb[0] == sizeof(float));
++    const int P = past->ne[0], T = xt->ne[0], C = past->ne[1];
++    GGML_ASSERT(w->ne[0] == P + 1 && w->ne[1] == C && xt->ne[1] == C && cur->ne[0] == C && ggml_nelements(dst) == (int64_t) C*T);
++    GGML_ASSERT(ggml_nelements(state) == (int64_t) P*C);
++    const int64_t n = (int64_t) C*T;
++    const int bs = 256;
++    k_ink_cat_conv_res<<<(n + bs - 1)/bs, bs, 0, ctx.stream()>>>((const char *) past->data, (const char *) xt->data, (const float *) w->data,
++            (const float *) cur->data, (float *) dst->data, (float *) state->data, P, T, C, past->nb[0], past->nb[1], xt->nb[0], xt->nb[1],
++            cur->nb[1]/sizeof(float), scale);
++}
+diff --git a/ggml/src/ggml-cuda/inkling.cuh b/ggml/src/ggml-cuda/inkling.cuh
+index 26ee30599..3b68d9b6c 100644
+--- a/ggml/src/ggml-cuda/inkling.cuh
++++ b/ggml/src/ggml-cuda/inkling.cuh
+@@ -45,3 +45,7 @@ void ggml_cuda_ink_cat_store(ggml_backend_cuda_context & ctx, const ggml_tensor
+ 
+ // dst = concat(a, rms_norm(b), 0)
+ void ggml_cuda_ink_cat_rms(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b, float eps, ggml_tensor * dst);
++
++// cat_store + conv_res in one kernel (one sequence): dst = scale*(cur + ssm_conv(concat(past, xt), w)), state = last P of the concat
++void ggml_cuda_ink_cat_conv_res(ggml_backend_cuda_context & ctx, const ggml_tensor * past, const ggml_tensor * xt, const ggml_tensor * w,
++        const ggml_tensor * cur, float scale, ggml_tensor * dst, ggml_tensor * state);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f85f91301..5449c344a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -14281,6 +14281,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
+     // Inkling 2 Mini decode shapes (n = 1)
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1024, 1, true));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 4096, 1, true));
++    test_cases.emplace_back(new test_ink_fa_rel_bias(GGML_TYPE_Q8_0, 1, 1024, 1024));
++    test_cases.emplace_back(new test_ink_fa_rel_bias(GGML_TYPE_Q8_0, 1, 4096, 1024));
++    test_cases.emplace_back(new test_ink_fa_rel_bias(GGML_TYPE_F16, 1, 512, 1024));
++    test_cases.emplace_back(new test_ink_fa_rel_bias(GGML_TYPE_F16, 1, 1024, 1024));
++    test_cases.emplace_back(new test_ink_fa_rel_bias(GGML_TYPE_F16, 1, 4096, 1024));
++    test_cases.emplace_back(new test_ink_fa_rel_bias(GGML_TYPE_F16, 1, 16384, 16));
++    test_cases.emplace_back(new test_ink_pattern("conv", 1, 1, 2304));
++    test_cases.emplace_back(new test_ink_pattern("conv", 1, 1, 1024));
+     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1}) {
+         for (auto mk : std::vector<std::pair<int64_t,int64_t>>{{3072, 2304}, {1024, 2304}, {2304, 3072}, {384, 2304}}) {
+-- 
+2.56.0
+

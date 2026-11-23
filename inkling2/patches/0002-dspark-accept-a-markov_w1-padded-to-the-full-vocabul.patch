@@ -1,0 +1,34 @@
+From e0918a326a0fdbed91e90319a7d3a9dde7959e07 Mon Sep 17 00:00:00 2001
+From: Hermes Reisner <hermes.reisner@stud.unibas.ch>
+Date: Sun, 22 Nov 2026 15:01:51 +0100
+Subject: [PATCH 2/6] dspark : accept a markov_w1 padded to the full vocabulary
+
+Converted Inkling 2 Mini drafts carry markov_w1 with the padded vocab (201024 rows) while the draft's
+n_vocab is the unpadded 200058. Rows are looked up by token id, so the larger tensor is fine.
+---
+ src/models/dspark.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/dspark.cpp b/src/models/dspark.cpp
+index 0538e2205..41157f9d5 100644
+--- a/src/models/dspark.cpp
++++ b/src/models/dspark.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include "models.h"
+ 
+ #include "llama-impl.h"
+@@ -81,7 +82,9 @@ void llama_model_dflash::load_tensors_dspark(int64_t n_vocab_draft) {
+ 
+     const int64_t dspark_markov_rank = ml->get_tensor_meta("markov_w1.weight")->ne[0];
+ 
+-    dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
++    // Unsloth files pad markov_w1 to the padded vocab (201024 vs 200058); rows are looked up by token id, so accept it
++    const int64_t dspark_markov_w1_rows = std::max<int64_t>(n_vocab, ml->get_tensor_meta("markov_w1.weight")->ne[1]);
++    dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, dspark_markov_w1_rows }, 0);
+     dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
+     dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
+     dspark_markov_w2_b = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "bias"),   { n_vocab_draft }, TENSOR_NOT_REQUIRED);
+-- 
+2.56.0
+

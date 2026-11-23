@@ -1,0 +1,331 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\sisetup{detect-all}
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible, breaklines=true, frame=none, xleftmargin=1em}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Two decode kernels for gfx906 in llama.cpp:\\a quantized matvec and flash decoding on the Radeon VII}
+\author{Hermes Reisner}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Generating one token with a quantized language model is a chain of matrix-vector products and, in long chats, an
+attention pass over the whole cache. On AMD's gfx906 (Radeon VII, Instinct MI50 and MI60) llama.cpp's generic HIP
+kernels use the card's memory bandwidth poorly for both. This note describes two kernels for single-token decode: a
+matrix-vector product for Q4\_0, Q4\_1 and IQ4\_NL weights, and a flash-decoding attention kernel for a q8\_0 cache. On a Radeon VII the matvec is 2 to 34\,\% faster than upstream on dense products with at least 512 rows
+(median 14 to 18\,\% depending on the format) and the attention kernel needs 453 instead of 787\,\textmu s at 64k keys.
+In whole models on the Radeon VII alone, Gemma 4 26B (Q4\_0) writes 10\,\% faster and Qwen 3.8 27B 3\,\% faster;
+prompt processing and perplexity do not change.
+The code was written with an AI coding agent (Claude Code). Every number here was measured on the card, every kernel
+is checked against llama.cpp's CPU reference, and the cases where the kernels did not help are reported too. Similar
+ideas exist in community forks; Section~\ref{sec:related} says which.
+\end{abstract}
+
+\section{Setup and motivation}
+
+The machine is a home server with a Radeon VII (gfx906, 60 compute units, 16\,GB HBM2 at 1\,TB/s, PCIe 3.0 x4) and an
+RX 9060 XT (gfx1200, 16\,GB) on Fedora 44 with Fedora's ROCm 7.1 packages. It serves a chat site, and the model this
+work was done for is Inkling 2 Mini (Thinking Machines): a 26.4B mixture of experts with 128 experts of which 8 are used
+per token, hidden size 2304, expert FFN size 1152, 24 query heads on 8 key/value heads of size 128, and 24 stored layers
+of which layers 6 to 17 run three times, so a token passes through 48 layers. Stored layers 0 to 17 live on the Radeon
+VII and the rest on the RX 9060 XT.
+
+At batch size one, decode is a long chain of small kernels. A profile showed about 2,200 kernel launches per token, and
+the VII's matrix-vector products reached only 200 to 260 of its roughly 1000\,GB/s. Raising power limits changed
+nothing, raising the memory clock changed nothing, and raising the core clock helped a little, so the kernels were
+bound by latency and instruction issue rather than by bandwidth. That is where both kernels start.
+
+\paragraph{gfx906 in brief.} A compute unit has four 16-wide SIMDs that run 64-wide wavefronts, up to 10 per SIMD
+(40 per compute unit), and 64\,KB of LDS. The chip has integer dot-product instructions
+(\code{v\_dot4\_i32\_i8}), which llama.cpp uses as \code{dp4a}. The MI50 is the same chip with 16 or 32\,GB, the MI60
+has 64 compute units and 32\,GB. Only the Radeon VII was tested.
+
+\section{The quantized matvec}
+
+\subsection{What upstream does}
+
+llama.cpp quantizes the activation vector to q8\_1 (36-byte blocks of 32 values: a scale and a sum as \code{half2},
+then 32 \code{int8}) and runs one kernel family, \code{mul\_mat\_vec\_q}, for all weight formats. Each thread handles
+\code{vdr} 32-bit words of a block, so for the four formats here two threads share one 32-value block; on GCN a row
+gets one 128-thread workgroup. The weight blocks are 18 bytes (Q4\_0, IQ4\_NL), 20 bytes (Q4\_1) and 34 bytes (Q8\_0),
+so most of them are only 2-byte aligned.
+
+\subsection{Whole blocks per lane}
+
+In the new kernel each lane computes whole blocks and accumulates them in a register; lanes of a row only meet in a
+final shuffle reduction. A Q4\_0 or IQ4\_NL block is read with nine 2-byte loads (the block is only 2-byte aligned)
+and a Q4\_1 block, which is 4-byte aligned, with five 4-byte loads. An earlier version also covered Q8\_0 (34-byte
+blocks, seventeen 2-byte loads); it was not faster than upstream and was dropped. Eight \code{dp4a}
+instructions then cover the 32 values. IQ4\_NL needs a 16-entry table lookup per nibble; it uses the same
+\code{v\_perm}-based helper as upstream (\code{get\_int\_from\_table\_16}) and is still the most expensive format on
+this card: memory at 1200 instead of 1000\,MHz changed nothing, the core clock did. This is why the Inkling model file
+uses Q4\_1 for the experts.
+
+The microbenchmark in \code{bench/mvbench.hip} compares this ``direct'' variant with others on the Inkling expert
+shapes: staging the weights in LDS with 16-byte loads first, several blocks' loads in flight per lane, and aligned
+16-byte plus 4-byte loads with \code{alignbyte}. All were slower than the direct version.
+
+\subsection{Experts}
+
+For \code{MUL\_MAT\_ID} (mixture-of-experts products) a 128-thread workgroup computes 16 rows with 8 lanes each and
+first copies the activation column into LDS, so the 16 rows share one copy instead of reading it from memory 16 times.
+The activation must fit (at most 1024 blocks, 36\,KB). Q8\_0 experts are left to the generic kernel, which was faster
+there (103 against 121\,\textmu s).
+
+\subsection{Dense products and a floor at 2048 workgroups}
+\label{sec:floor}
+
+The first version used 64-thread workgroups (one wavefront) with 2 rows of 32 lanes. It was faster on large products
+and on Inkling's shapes, but on Qwen 3.8 27B in Q4\_0 the whole model got 5\,\% slower. A sweep over the decode shapes
+of several models and eight lane layouts explained it. Every 64-thread layout has a time floor of about 57\,\textmu s when the grid has about 2048
+workgroups, whatever the matrix size: 2048 rows at 1 row per workgroup, 4096 rows at 2, 8192 at 4 and 16384 at 8 all
+land there (Table~\ref{tab:floor}). Grids slightly above (2304 workgroups) or below (1536) are fine, and a matrix large
+enough to need more than 57\,\textmu s anyway hides it. Upstream's 128-thread workgroups do not show it, and neither
+do the same layouts with two wavefronts per workgroup. The cause is not known; it looks like a limit in how the card
+dispatches many one-wavefront workgroups.
+
+\begin{table}[ht]
+\centering
+\caption{Q4\_0 matvec, one token, Radeon VII, \textmu s. Layouts are rows per workgroup x lanes per row.}
+\label{tab:floor}
+\begin{tabular}{rrr rrrr rr}
+\toprule
+& & & \multicolumn{4}{c}{64 threads} & \multicolumn{2}{c}{128 threads} \\
+\cmidrule(lr){4-7}\cmidrule(lr){8-9}
+rows & K & upstream & 1x64 & 2x32 & 4x16 & 8x8 & 2x64 & 4x32 \\
+\midrule
+ 2048 & 4096 & 14.9 & \textbf{57.6} & 13.6 & 16.3 & 19.9 & 13.6 & 13.9 \\
+ 4096 & 2048 & 15.9 & 15.3 & \textbf{57.6} & 13.6 & 16.8 & 14.4 & 13.5 \\
+ 4096 & 4096 & 23.6 & 24.8 & \textbf{57.5} & 21.2 & 28.6 & 20.6 & 21.9 \\
+ 4608 & 2048 & 16.9 & 16.3 & 14.0 & 14.7 & 17.7 & 15.6 & 14.3 \\
+ 8192 & 2048 & 25.2 & 24.2 & 24.6 & \textbf{57.6} & 21.8 & 22.5 & 20.5 \\
+16384 & 2048 & 45.3 & 42.8 & 36.9 & 48.9 & \textbf{57.5} & 38.8 & 34.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The final kernel therefore uses 128-thread workgroups everywhere: 4 rows of 32 lanes, 2 rows of 64 lanes below 2048
+rows, 8 rows of 16 lanes when $K < 2048$, and the generic kernel below 512 rows, where it is as fast. The rule was
+chosen on the same shapes it is reported on below, so those numbers are not an independent test; the whole-model
+runs are. Dense Q8\_0 was not faster with any layout (median $+2\,\%$), so Q8\_0 stays with the generic kernel.
+
+\subsection{Fused gate}
+
+Upstream fuses the gate and up products of a feed-forward layer with the activation function (SwiGLU, GeGLU and their
+clamped variants) into one matvec. The first version skipped fused products, so on Gemma 4 and Qwen it only reached
+the attention and down projections, and Gemma 4 26B gained less than 1\,\%. The kernel now computes the gate row next
+to the up row and applies the activation with upstream's \code{ggml\_cuda\_op\_glu\_single}. Products with a fused
+bias or scale still go to the generic kernel.
+
+\subsection{Results}
+
+Table~\ref{tab:mmv} shows selected shapes; over all 49 shapes with at least 512 rows the change against upstream is
+$-2$ to $-28\,\%$ for Q4\_0 (median $-14\,\%$), $-5$ to $-34\,\%$ for Q4\_1 (median $-18\,\%$) and 0 to $-31\,\%$ for
+IQ4\_NL (median $-15\,\%$). Below 512 rows the generic kernel runs, so nothing changes there.
+
+\begin{table}[ht]
+\centering
+\caption{Matrix-vector product for one token on the Radeon VII, \textmu s, upstream / this kernel
+(\code{test-backend-ops perf}, llama.cpp \code{94f3af3d0}). Rows x K; the example names a model with that shape.}
+\label{tab:mmv}
+\small
+\begin{tabular}{rl rr rr rr}
+\toprule
+shape & example & \multicolumn{2}{c}{Q4\_0} & \multicolumn{2}{c}{Q4\_1} & \multicolumn{2}{c}{IQ4\_NL} \\
+\midrule
+1024 x 4096 & Llama 3 8B, k/v & 9.9 & 9.1 & 9.3 & 8.2 & 10.4 & 9.4 \\
+2304 x 2304 & Inkling 2 Mini & 12.5 & 11.7 & 12.4 & 9.6 & 14.0 & 12.8 \\
+4096 x 4096 & Llama 3 8B, q/o & 23.6 & 21.9 & 21.8 & 20.5 & 24.4 & 22.9 \\
+4096 x 14336 & Llama 3 8B, down & 71.6 & 64.2 & 65.4 & 55.2 & 73.6 & 67.0 \\
+14336 x 4096 & Llama 3 8B, up & 68.2 & 56.1 & 61.6 & 53.1 & 70.5 & 57.8 \\
+6144 x 5120 & Qwen 3.8 27B & 39.6 & 34.5 & 36.5 & 30.6 & 40.7 & 34.7 \\
+5120 x 17408 & Qwen 3.8 27B, down & 106.4 & 88.4 & 97.4 & 76.3 & 109.7 & 90.9 \\
+8192 x 8192 & 70B, q/o & 78.2 & 66.2 & 71.2 & 64.0 & 80.5 & 68.3 \\
+28672 x 8192 & 70B, up & 259.0 & 211.3 & 234.2 & 200.3 & 266.3 & 216.8 \\
+151936 x 2048 & output head, 2048 hidden & 378.7 & 272.9 & 377.4 & 247.9 & 410.6 & 285.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In whole models (Table~\ref{tab:models}) the gain is smaller, because other operations take their share of each
+token: the Q6\_K output head of Qwen 3.8, its recurrent layers and the attention. The Qwen file in IQ4\_XS, which the
+kernel does not cover, is the control and does not change.
+
+\begin{table}[ht]
+\centering
+\caption{Writing speed (\code{llama-bench}, 128 tokens, flash attention on), Radeon VII alone, tok/s, mean of the runs
+after the first. The Qwen files in Q4\_0 and IQ4\_NL were requantized from the Q6\_K file for this test.}
+\label{tab:models}
+\begin{tabular}{lrrr}
+\toprule
+model & upstream & this kernel & change \\
+\midrule
+Gemma 4 26B-A4B, QAT Q4\_0 & 91.9 & 101.5 & $+10\,\%$ \\
+Qwen 3.8 27B, Q4\_0 & 30.1 & 31.1 & $+3\,\%$ \\
+Qwen 3.8 27B, IQ4\_NL & 28.5 & 29.3 & $+3\,\%$ \\
+Qwen 3.8 27B, UD-IQ4\_XS (not covered) & 25.4 & 25.6 & $\pm 0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Output and prompt speed were checked too. Perplexity on wikitext-2 with batches of one token, so that every token goes
+through the kernel, is 6.031 with the generic kernel and 6.034 with this one (Qwen 3.8 27B Q4\_0, 4 chunks of 512).
+Greedy answers start identically and drift apart after 10 to 40 tokens, which is what a different summation order
+does at near-ties; both versions stay coherent. Prompt processing (512 tokens) is 350.7 against 349.2\,tok/s, i.e.
+unchanged, since the kernel only runs for one token.
+
+\section{Flash decoding}
+
+\subsection{The vector kernel at long context}
+
+For one query token llama.cpp uses its vector flash-attention kernel. It assigns one query head per workgroup and can
+split the keys over several workgroups (\code{parallel\_blocks}) with a combine pass. With 3 query heads per key/value
+head (Inkling 2: 24 on 8), each key/value row is therefore read three times, and on the VII the kernel moved about
+160\,GB/s at 32k to 64k keys with a q8\_0 cache.
+
+\subsection{Design}
+
+The new kernel (\code{flash-decoding/fattn-gcn-dec.cu}) is specialised to head size 128, 3 query heads per key/value
+head and a q8\_0 cache. The grid has one workgroup per key/value head and chunk of keys; a workgroup handles all 3 query
+heads, so it reads each key and value row once.
+\begin{enumerate}
+\item The 3 query vectors are quantized to \code{int8} per 32 values into LDS, with the softmax scale folded in.
+\item The workgroup walks over its chunk in tiles of 256 keys. Each lane loads one key's q8\_0 row (136 bytes, with
+16-byte loads) and computes its 3 scores with \code{dp4a}, then the optional Inkling 2 relative-position bias is added.
+The next tile's rows are loaded while the current tile does steps 3 and 4.
+\item An online softmax keeps a running maximum and sum per head; the accumulators are rescaled when the maximum grows.
+\item For the values, 8 lanes cover one row (16 values each), 32 rows are processed at a time and 4 rows of loads are
+kept in flight. Accumulation is in \code{half2}.
+\item Each chunk writes its partial output and its (maximum, sum); a second small kernel combines the chunks with a
+log-sum-exp and adds the attention sinks.
+\end{enumerate}
+The number of tiles per workgroup was measured: about $\sqrt{t}/2$ for $t$ tiles of keys (2 at 4k keys, 4 at 16k,
+8 at 64k). Fewer leave compute units idle, more lengthen each workgroup's chain of memory round trips.
+
+Two things did not work first. A version with \code{\_\_launch\_bounds\_\_(256, 2)} was limited to 128 registers and
+spilled 112 bytes per lane to scratch, which made it slower than the vector kernel; with \code{(256, 1)} it uses 155 to
+202 registers and does not spill (checked with \code{-Rpass-analysis=kernel-resource-usage}). And a version without the
+tile loop, one tile per workgroup, was slow at long context because it launched too many short workgroups.
+
+\subsection{Results}
+
+\begin{table}[ht]
+\centering
+\caption{Attention for one token, 24 query heads on 8 key/value heads, q8\_0 cache, Inkling 2 bias, Radeon VII
+(\code{test-backend-ops perf}).}
+\label{tab:fa}
+\begin{tabular}{rrrr}
+\toprule
+keys & vector kernel (\textmu s) & this kernel (\textmu s) & change \\
+\midrule
+ 1k  & 23.7 & --- & \\
+ 4k  & 64.1 & --- & \\
+ 8k  & 110.2 & 92.4 & $-16\,\%$ \\
+16k  & 210.4 & 162.0 & $-23\,\%$ \\
+32k  & 407.5 & 225.7 & $-45\,\%$ \\
+64k  & 786.7 & 453.1 & $-42\,\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Below 6144 keys the vector kernel is as fast, so the new kernel is only used from there on
+(\code{GGML\_CUDA\_GCN\_FA\_DEC\_MIN\_KV}). In Inkling 2 most layers use a 1024-token sliding window and never reach
+that, so the kernel only changes the few global layers. In the whole model, writing 160 tokens after a document of 34k
+tokens went from 38.5 to 40.4\,tok/s and after 68.5k tokens from 33.5 to 37.0 (mean of two runs, 131k context, both
+cards otherwise idle). After 8.6k tokens the difference (43.9 against 43.5) is within the run-to-run noise. Reading
+speed does not change.
+
+\section{How it was checked}
+
+\begin{itemize}
+\item \textbf{Against the CPU.} \code{test-backend-ops} compares each GPU op with llama.cpp's CPU implementation.
+Upstream llama.cpp with the matvec patch, on the Radeon VII: 683 \code{MUL\_MAT} and \code{MUL\_MAT\_ID} cases and 341
+fused gate/up cases (\code{MUL\_MAT\_FUSION}) for Q4\_0, Q4\_1, IQ4\_NL and Q8\_0. The Inkling 2 tree, with both
+cards in one process: on the Radeon VII 431 \code{MUL\_MAT} and 262 \code{MUL\_MAT\_ID} cases, 67 Inkling 2 op cases
+including attention with the bias up to 33k keys, and 6 added plain attention cases (7000 to 16384 keys, with and
+without sinks); on the RX 9060 XT 914 float \code{MUL\_MAT} cases without rocBLAS and the 67 Inkling 2 cases. All pass.
+\item \textbf{The whole model.} Inkling 2 Mini finds the needle in a 64k and a 118k token document; wikitext-2
+perplexity of the model file is 6.982 against 6.916 for ggml-org's IQ4\_NL file; 12 of 12 tasks of a small private
+evaluation pass.
+\item \textbf{Speed.} Every speed number is from \code{test-backend-ops perf}, \code{llama-bench} or the chat server on
+the Radeon VII at stock clocks (1801\,MHz, memory 1000\,MHz), with the other card idle unless stated.
+\end{itemize}
+Not checked: an MI50 or MI60 (same instruction set, the MI60 has 64 compute units), other ROCm versions than Fedora's
+7.1, other operating systems, and models with other head sizes or group sizes for the attention kernel.
+
+\section{Related work}
+\label{sec:related}
+
+Both ideas have precedents, and the gfx906 community has been active:
+\begin{itemize}
+\item \textbf{iacopPBK/llama.cpp-gfx906} already computes whole Q4\_0, Q4\_1 and Q8\_0 blocks per lane at one column,
+with 2 rows of 32 lanes, but only for $K \le 1024$; its comment says it wins only on small matrices. It has no IQ4\_NL
+path in that kernel.
+\item \textbf{exabit-io/mx-llama.cpp} (and the retired exabit-io/llama.cpp) has a gfx906 Q8\_0 path that processes a
+whole block per thread at one column, with an optional LDS-staged activation.
+\item \textbf{Martin1701/MI50-llama.cpp} has a gfx906 attention kernel that shares a q8\_0 key/value load across six
+query heads, quantizes the query into shared memory and uses upstream's split and combine, specialised to head size
+256 (Qwen 3.8 27B). It accumulates in \code{float}. \textbf{0c33/mi50-vllm-lab} has a vLLM kernel with 256-key tiles,
+six-head sharing and an online softmax for vLLM's own int8 cache.
+\item \textbf{Upstream} has merged GCN tuning for the prompt-processing kernels (\#27841, \#30021, \#30022) and the
+tile attention kernel (\#15769, \#15884, \#15927); \#29534 (wave64 for GCN q8 attention) and \#30344 were open in
+November 2026. Issue \#31765 proposed gfx906 decode kernels and is closed.
+\end{itemize}
+What this note adds: the matvec for Q4\_0, Q4\_1 and IQ4\_NL at every $K$, with the expert path, the fused gate and a
+layout rule measured on 51 shapes per format; the observation about 2048 one-wavefront workgroups (Section~\ref{sec:floor}); an attention
+kernel for head size 128 with 3 query heads per key/value head; and a patch against current upstream llama.cpp rather
+than a fork.
+
+\section{What did not help}
+
+\begin{itemize}
+\item Speculative decoding with Inkling's DSpark draft model: at most +4\,\% on short answers and slower on long ones,
+because verifying 4 tokens touches up to 32 experts.
+\item Raising power limits, overclocking the memory, other output-head formats, other layer splits.
+\item Staging weights in LDS, aligned 4-byte loads for the 18-byte blocks, a dedicated expert-router kernel (the fused
+one takes 1.6\,\textmu s), polling instead of interrupts (\code{HSA\_ENABLE\_INTERRUPT=0}, much slower).
+\item A GQA-packed version of the generic vector attention kernel and 64-thread blocks for it: correct, but slower
+below 6k keys.
+\item Fusing Inkling's conv state store with its short convolution: correct, no measurable gain.
+\item A Vulkan fork that reaches 108\,tok/s on one RX 7900 XT: 32\,tok/s here, the Radeon VII is slow under RADV.
+\end{itemize}
+
+\section{Limits}
+
+The matvec covers one token and the formats Q4\_0, Q4\_1 and IQ4\_NL, not Q8\_0 and not the K-quants that most
+downloaded files use. The attention kernel only covers head size 128, 3 query heads per key/value head and a q8\_0 cache, and it
+lives in the Inkling 2 tree, since upstream llama.cpp does not support Inkling 2 yet. Prompt processing uses the stock
+kernels. The matvec patch is not upstreamed; llama.cpp asks contributors to disclose AI use and to be able to explain
+and maintain every line, which is a decision for the author, not for the agent that wrote it.
+
+\appendix
+\section{Reproducing}
+
+\begin{lstlisting}
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+git checkout 94f3af3d0            # the commit the patch was tested on
+git apply ../matvec/gcn-mmv.diff
+HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" cmake -S . -B build \
+    -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 8 --target llama-bench test-backend-ops
+build/bin/test-backend-ops test -o MUL_MAT,MUL_MAT_ID -p "type_a=(q4_0|q4_1|iq4_nl|q8_0)"
+GGML_CUDA_GCN_MMV=0 build/bin/llama-bench -m model.gguf -p 0 -n 128   # upstream kernel
+GGML_CUDA_GCN_MMV=1 build/bin/llama-bench -m model.gguf -p 0 -n 128   # this one (default)
+\end{lstlisting}
+For the Inkling 2 tree with the attention kernel, see \code{inkling2/README.md} in the repository.
+
+\end{document}
