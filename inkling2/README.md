@@ -29,9 +29,16 @@ The needle in a 64k and a 118k document is found. For comparison, the same machi
 
 ## Things that cost time and may save you some
 
-- **"no kernel image is available for execution on the device" with two different AMD GPUs.** Fedora's rocBLAS 7.1
-  loads the kernel library of only one GPU per process, so the second card fails as soon as llama.cpp calls rocBLAS.
-  Patch 1 adds `GGML_CUDA_RDNA_NO_BLAS=1`: the RDNA card then computes float products with llama.cpp's own kernels.
+- **"no kernel image is available for execution on the device" with two different AMD GPUs.** rocBLAS loads the
+  kernel library of only one GPU per process, so the second card fails as soon as llama.cpp calls rocBLAS
+  ([ROCm/rocm-libraries#3413](https://github.com/ROCm/rocm-libraries/issues/3413); the same error on a 9060 XT + MI50
+  in [llama.cpp#19893](https://github.com/ggml-org/llama.cpp/issues/19893)).
+  - **Upstream fix:** [ROCm/rocm-libraries#4781](https://github.com/ROCm/rocm-libraries/pull/4781) gives each GPU
+    architecture its own library. It is in TheRock 7.12 and later, but not in ROCm 7.2.x. Fedora 44 and 45 ship
+    rocBLAS 7.1.1 and 7.2.0 without it (checked 2026-11-23).
+  - **Not tested here:** the fix, and gfx906 on TheRock (listed there as building, not tested).
+  - **Workaround:** patch 1 adds `GGML_CUDA_RDNA_NO_BLAS=1`. The RDNA card then computes float products with
+    llama.cpp's own kernels.
 - **The layer split of a looped model.** Weights are placed by stored layer, but `-ts` counts the 48 layer passes:
   stored layer i lands on the card that owns logical position i. `-ts 18,30` puts stored layers 0 to 17 (the whole
   loop) on the Radeon VII and layers 18 to 23 plus the output head on the RX 9060 XT. A 50/50 split puts everything on

@@ -7,7 +7,7 @@ Instinct MI60), and the setup that runs Inkling 2 Mini on a Radeon VII next to a
 |---|---|
 | [`matvec/`](matvec/) | A matrix-vector product for Q4_0, Q4_1 and IQ4_NL weights, as one patch for current upstream llama.cpp (162 added lines in `mmvq.cu`). |
 | [`flash-decoding/`](flash-decoding/) | Attention for one token over a long q8_0 cache, head size 128, 3 query heads per key/value head. |
-| [`inkling2/`](inkling2/) | Inkling 2 Mini at about 48 tok/s on a Radeon VII + RX 9060 XT, with a fix for Fedora's rocBLAS failing on mixed GPUs. |
+| [`inkling2/`](inkling2/) | Inkling 2 Mini at about 48 tok/s on a Radeon VII + RX 9060 XT, with a workaround for a rocBLAS bug on mixed GPUs. |
 | [`writeup/`](writeup/gfx906-decode-kernels.pdf) | A six-page write-up of both kernels: design, measurements, what did not work. |
 | [`bench/`](bench/) | The standalone microbenchmark the matvec kernel came from. |
 
@@ -105,9 +105,10 @@ other operating systems.
   128-thread workgroups do not show it. If a small kernel on a Radeon VII is inexplicably slow, check the grid size.
 - **IQ4_NL is compute bound on this card.** The table lookup costs more than the memory traffic: a higher memory
   clock changed nothing, a higher core clock did. Q4_1 is the fastest 4-bit format here.
-- **"no kernel image is available for execution on the device" with two different AMD GPUs** on Fedora's rocBLAS 7.1:
-  it loads the kernels of only one GPU per process. `inkling2/patches/0001` lets the RDNA card skip rocBLAS
-  (`GGML_CUDA_RDNA_NO_BLAS=1`).
+- **"no kernel image is available for execution on the device" with two different AMD GPUs:** rocBLAS loads the
+  kernels of only one GPU per process ([ROCm/rocm-libraries#3413](https://github.com/ROCm/rocm-libraries/issues/3413)).
+  The upstream fix is in TheRock 7.12 and later, not in ROCm 7.2.x (details in [`inkling2/`](inkling2/)). Until your
+  rocBLAS has it, `inkling2/patches/0001` lets the RDNA card skip rocBLAS (`GGML_CUDA_RDNA_NO_BLAS=1`).
 - **ROCm in a container** reports no device at all when only one card's render node is passed in. Pass all render
   nodes and pick the card with `ROCR_VISIBLE_DEVICES`.
 - **Register spills** made the first flash-decoding kernel slower than the stock one. `__launch_bounds__(256, 2)`
